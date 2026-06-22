@@ -87,14 +87,17 @@ void printOutESP32Error(esp_err_t err) {
   }
 }
 
-static void onButtonLongPressUpEventCb(void *button_handle, void *usr_data) {
-  Serial.println("Button long press end");
-  delay(10);
-  sleepRequested = true;
+// Button (non-touch) callbacks -> Chronicle button-events. Long hold -> sleep.
+static void onButtonSingleClickCb(void *button_handle, void *usr_data) {
+  sendButtonEvent("SINGLE_PRESS");
 }
 
 static void onButtonDoubleClickCb(void *button_handle, void *usr_data) {
-  Serial.println("Button double click");
+  sendButtonEvent("DOUBLE_PRESS");
+}
+
+static void onButtonLongPressUpEventCb(void *button_handle, void *usr_data) {
+  Serial.println("Button long press -> sleep");
   delay(10);
   sleepRequested = true;
 }
@@ -106,6 +109,11 @@ void getAuthTokenFromNVS() {
 }
 
 void setupWiFi() {
+#ifdef CHRONICLE_MODE
+  // Bake in the device's network so it joins without the captive portal.
+  // (apList is empty on each boot, so this stays a single NVS entry.)
+  WifiManager.addWifi(WIFI_SSID, WIFI_PASS);
+#endif
   WifiManager.startBackgroundTask(
       "ELATO-DEVICE"); // Run the background task to take care of our Wifi
   WifiManager.fallbackToSoftAp(
@@ -123,44 +131,67 @@ void setupWiFi() {
   webServer.begin();
 }
 
+// Touch -> Chronicle button-events:
+//   short tap          -> SINGLE_PRESS
+//   two taps (<400ms)  -> DOUBLE_PRESS
+//   long hold (>1.5s)  -> sleep
 void touchTask(void *parameter) {
   touch_pad_init();
   touch_pad_config(TOUCH_PAD_NUM2);
 
   bool touched = false;
-  unsigned long pressStartTime = 0;
-  unsigned long lastTouchTime = 0;
-  const unsigned long LONG_PRESS_DURATION = 500; // 500ms for long press
+  bool longHandled = false;
+  bool tapPending = false;
+  unsigned long pressStart = 0;
+  unsigned long lastRelease = 0;
+  unsigned long tapFirstTime = 0;
+  const unsigned long LONG_PRESS_MS = 1500;
+  const unsigned long DOUBLE_GAP_MS = 400;
+  const unsigned long TAP_MAX_MS = 800;
+  const unsigned long DEBOUNCE_MS = 50;
 
   while (1) {
-    // Read the touch sensor
     uint32_t touchValue = touchRead(TOUCH_PAD_NUM2);
     bool isTouched = (touchValue > TOUCH_THRESHOLD);
-    unsigned long currentTime = millis();
+    unsigned long now = millis();
 
-    // Initial touch detection
-    if (isTouched && !touched &&
-        (currentTime - lastTouchTime > TOUCH_DEBOUNCE_DELAY)) {
+    // Press edge
+    if (isTouched && !touched && (now - lastRelease > DEBOUNCE_MS)) {
       touched = true;
-      pressStartTime = currentTime; // Start timing the press
-      lastTouchTime = currentTime;
+      pressStart = now;
+      longHandled = false;
     }
 
-    // Check for long press while touched
-    if (touched && isTouched) {
-      if (currentTime - pressStartTime >= LONG_PRESS_DURATION) {
-        sleepRequested =
-            true; // Only enter sleep after 500ms of continuous touch
+    // Long hold -> sleep
+    if (touched && isTouched && !longHandled &&
+        (now - pressStart >= LONG_PRESS_MS)) {
+      longHandled = true;
+      sleepRequested = true;
+    }
+
+    // Release edge
+    if (!isTouched && touched) {
+      touched = false;
+      lastRelease = now;
+      unsigned long dur = now - pressStart;
+      if (!longHandled && dur < TAP_MAX_MS) {
+        if (tapPending && (now - tapFirstTime <= DOUBLE_GAP_MS)) {
+          tapPending = false;
+          sendButtonEvent("DOUBLE_PRESS");
+        } else {
+          tapPending = true;
+          tapFirstTime = now;
+        }
       }
     }
 
-    // Release detection
-    if (!isTouched && touched) {
-      touched = false;
-      pressStartTime = 0; // Reset the press timer
+    // Resolve a single tap once the double-tap window passes
+    if (tapPending && (now - tapFirstTime > DOUBLE_GAP_MS)) {
+      tapPending = false;
+      sendButtonEvent("SINGLE_PRESS");
     }
 
-    vTaskDelay(20); // Reduced from 50ms to 20ms for better responsiveness
+    vTaskDelay(20);
   }
   vTaskDelete(NULL);
 }
@@ -198,9 +229,9 @@ void setup() {
   getErr = esp_sleep_enable_ext0_wakeup(BUTTON_PIN, LOW);
   printOutESP32Error(getErr);
   Button *btn = new Button(BUTTON_PIN, false);
-  btn->attachLongPressUpEventCb(&onButtonLongPressUpEventCb, NULL);
+  btn->attachSingleClickEventCb(&onButtonSingleClickCb, NULL);
   btn->attachDoubleClickEventCb(&onButtonDoubleClickCb, NULL);
-  btn->detachSingleClickEvent();
+  btn->attachLongPressUpEventCb(&onButtonLongPressUpEventCb, NULL);
 #endif
 
   // Pin audio tasks to Core 1 (application core)

@@ -13,7 +13,70 @@
 #include <Preferences.h>
 #include <Config.h>
 
+#ifdef CHRONICLE_MODE
+// Minimal percent-encoder for x-www-form-urlencoded values.
+static String urlEncode(const String &s) {
+  String out;
+  const char *hex = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0xF];
+      out += hex[c & 0xF];
+    }
+  }
+  return out;
+}
+
+// POST /auth/jwt/login -> store access_token in authTokenGlobal.
+// Always logs in fresh (JWT expires ~1h; we re-login on every (re)connect).
+bool chronicleLogin() {
+  HTTPClient http;
+  String url = "http://" + String(backend_server) + ":" + String(backend_port) +
+               "/auth/jwt/login";
+  http.begin(url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.setTimeout(10000);
+
+  String body = "username=" + urlEncode(CHRONICLE_USER) +
+                "&password=" + urlEncode(CHRONICLE_PASS);
+  int httpCode = http.POST(body);
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, payload);
+    if (error) {
+      Serial.print("Chronicle login JSON parse failed: ");
+      Serial.println(error.c_str());
+      http.end();
+      return false;
+    }
+    String token = doc["access_token"] | "";
+    http.end();
+    if (token.isEmpty()) {
+      Serial.println("Chronicle login: no access_token in response");
+      return false;
+    }
+    authTokenGlobal = token;
+    Serial.println("Chronicle login OK (JWT acquired)");
+    return true;
+  }
+
+  Serial.printf("Chronicle login failed: HTTP %d\n", httpCode);
+  http.end();
+  return false;
+}
+#endif
+
 bool isDeviceRegistered() {
+#ifdef CHRONICLE_MODE
+  // Always re-authenticate so an expired JWT is refreshed on (re)connect.
+  return chronicleLogin();
+#else
   if (!authTokenGlobal.isEmpty()) {
     return true;
   }
@@ -62,6 +125,7 @@ bool isDeviceRegistered() {
     // If we get here, either the request failed or no token was found
     http.end();
     return false;
+#endif
 }
 
 void connectCb() {

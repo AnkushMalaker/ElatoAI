@@ -79,9 +79,18 @@ const char *ws_server = "elato.akash-b25.workers.dev";
 const uint16_t ws_port = 443;
 const char *ws_path = "/ws/esp32";
 #endif
-// Backend server details 
+// Backend server details
 const char *backend_server = "www.elatoai.com"; // like www.facebook.com or facebook.vercel.app
 const uint16_t backend_port = 3000;
+
+#elif defined(CHRONICLE_MODE)
+// CHRONICLE - direct plain ws:// to backend on the LAN (no TLS)
+const char *ws_server = CHRONICLE_HOST;
+const uint16_t ws_port = CHRONICLE_PORT;
+const char *ws_path = "/ws";
+// HTTP backend (same host/port) for JWT login
+const char *backend_server = CHRONICLE_HOST;
+const uint16_t backend_port = CHRONICLE_PORT;
 #endif
 
 String authTokenGlobal;
@@ -239,5 +248,11 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----
 )EOF";
 #endif
+
+#elif defined(CHRONICLE_MODE)
+// CHRONICLE talks plain ws:// on the LAN - no certs used, but the symbols must
+// exist because Config.h declares them extern.
+const char *Vercel_CA_cert = "";
+const char *CA_cert = "";
 
 #endif

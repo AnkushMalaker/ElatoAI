@@ -8,17 +8,20 @@
 #include <WiFiClientSecure.h>
 #include <WebSocketsClient.h>
 
+#include "secrets.h"
+
 // ---------- CHOOSE YOUR MODE ----------
-// Pick one of the following (DEV_MODE, PROD_MODE, ELATO_MODE) , comment the rest
-// For ELATO_MODE, you will need to register your DIY Hardware on the Elato website
+// Pick one of the following (DEV_MODE, PROD_MODE, ELATO_MODE, CHRONICLE_MODE), comment the rest.
+// CHRONICLE_MODE talks directly to a Chronicle backend over plain ws:// on the LAN
+// (Wyoming protocol, PCM codec, JWT auth). Config in secrets.h.
 
 // #define DEV_MODE
 // #define PROD_MODE
-#define ELATO_MODE
+// #define ELATO_MODE
+#define CHRONICLE_MODE
 
-// ---------- CHOOSE YOUR VOICE SERVER ----------
-// Keep this separate from DEV/PROD/ELATO so the deployment mode and the voice backend stay independent.
-// Pick one backend for websocket voice traffic.
+// ---------- CHOOSE YOUR VOICE SERVER (Elato/Deno/Cloudflare only) ----------
+// Unused in CHRONICLE_MODE. Kept so the other modes still compile.
 
 // #define VOICE_SERVER_DENO
 #define VOICE_SERVER_CLOUDFLARE

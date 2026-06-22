@@ -5,11 +5,23 @@ int fadeAmount = 5;
 static unsigned long lastToggle = 0;
 static bool ledState = false;
 
+// led-control override (set by the backend via the websocket downlink)
+static volatile uint8_t ovR = 0, ovG = 0, ovB = 0;
+static volatile uint32_t ovUntil = 0;
+
 void setLEDColor(uint8_t r, uint8_t g, uint8_t b)
 {
     analogWrite(RED_LED_PIN, r);
     analogWrite(GREEN_LED_PIN, g);
     analogWrite(BLUE_LED_PIN, b);
+}
+
+void setLedOverride(uint8_t r, uint8_t g, uint8_t b, uint32_t durationMs)
+{
+    ovR = r;
+    ovG = g;
+    ovB = b;
+    ovUntil = millis() + durationMs;
 }
 
 enum class StaticColor : uint8_t
@@ -274,6 +286,14 @@ void ledTask(void *parameter)
     while (1)
     {
         currentTime += 20; // Track time based on vTaskDelay
+
+        // Backend led-control override takes priority while active.
+        if (millis() < ovUntil)
+        {
+            setLEDColor(ovR, ovG, ovB);
+            vTaskDelay(20 / portTICK_PERIOD_MS);
+            continue;
+        }
 
         // Toggle LED state every 200ms for blinking functions
         if (currentTime - lastToggle >= 200)
