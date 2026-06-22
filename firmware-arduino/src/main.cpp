@@ -3,6 +3,7 @@
 #include "OTA.h"
 #include "WifiManager.h"
 #include <driver/touch_sensor.h>
+#include <esp_sleep.h>
 
 #define TOUCH_THRESHOLD 28000
 #define REQUIRED_RELEASE_CHECKS                                                \
@@ -12,6 +13,7 @@
 AsyncWebServer webServer(80);
 WIFIMANAGER WifiManager;
 esp_err_t getErr = ESP_OK;
+TaskHandle_t touchTaskHandle = NULL;
 
 // Main Thread -> onButtonLongPressUpEventCb -> enterSleep()
 // Main Thread -> onButtonDoubleClickCb -> enterSleep()
@@ -49,12 +51,44 @@ void enterSleep() {
   Serial.flush();
 
 #ifdef TOUCH_MODE
-  touch_pad_intr_disable(TOUCH_PAD_INTR_MASK_ALL);
+  // Stop the touch task from polling the pad while we reconfigure the touch
+  // FSM for sleep wakeup. enterSleep() runs on the main loop task, but
+  // touchTask keeps calling touchRead() every 20ms on its own; a concurrent
+  // read racing touchSleepWakeUpEnable() leaves the wakeup misconfigured so
+  // the device never wakes on touch. Suspend it and let any in-flight read
+  // finish before we touch the peripheral.
+  if (touchTaskHandle != NULL) {
+    vTaskSuspend(touchTaskHandle);
+    delay(50);
+  }
+
+  // Wait for the finger to come off the pad before arming wakeup.
   while (touchRead(TOUCH_PAD_NUM2) > TOUCH_THRESHOLD) {
     delay(50);
   }
   delay(500);
-  touchSleepWakeUpEnable(TOUCH_PAD_NUM2, TOUCH_THRESHOLD);
+
+  // Arm touch wakeup. CRUCIAL: the sleep wake threshold is a DELTA above the
+  // sleep-channel benchmark (the auto-tracked untouched baseline), NOT an
+  // absolute touchRead() value. A finger only adds a few thousand counts above
+  // benchmark -- and far fewer on battery: with USB unplugged the board ground
+  // floats, so the finger couples to ground much more weakly than when USB ties
+  // the board to mains earth. The old absolute-style threshold (~25k) was only
+  // ever crossable with USB's earth reference, which is exactly why wake worked
+  // plugged in but never on battery. Set a small delta relative to the measured
+  // sleep benchmark so a floating-ground touch still crosses it.
+  touchSleepWakeUpEnable(TOUCH_PAD_NUM2, 1500); // full sleep-channel init
+  delay(20);                                    // let the benchmark settle
+  uint32_t sleepBenchmark = 0;
+  touch_pad_sleep_channel_read_benchmark(TOUCH_PAD_NUM2, &sleepBenchmark);
+  uint32_t wakeDelta = sleepBenchmark / 10; // ~10% of benchmark
+  if (wakeDelta < 1500) {
+    wakeDelta = 1500; // floor: stay above noise
+  }
+  touch_pad_sleep_set_threshold(TOUCH_PAD_NUM2, wakeDelta);
+  Serial.printf("Touch sleep wakeup armed: benchmark=%u, wakeDelta=%u\n",
+                sleepBenchmark, wakeDelta);
+  Serial.flush();
 #endif
 
   esp_deep_sleep_start();
@@ -217,6 +251,14 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  // Report why we booted so touch wakeup from deep sleep is verifiable.
+  esp_sleep_wakeup_cause_t wakeupCause = esp_sleep_get_wakeup_cause();
+  if (wakeupCause == ESP_SLEEP_WAKEUP_TOUCHPAD) {
+    Serial.println("Woke up from touchpad deep sleep.");
+  } else {
+    Serial.printf("Normal startup (wake cause %d).\n", (int)wakeupCause);
+  }
+
   // SETUP
   setupDeviceMetadata();
   wsMutex = xSemaphoreCreateMutex();
@@ -224,7 +266,7 @@ void setup() {
 // INTERRUPT
 #ifdef TOUCH_MODE
   xTaskCreate(touchTask, "Touch Task", 4096, NULL, configMAX_PRIORITIES - 2,
-              NULL);
+              &touchTaskHandle);
 #else
   getErr = esp_sleep_enable_ext0_wakeup(BUTTON_PIN, LOW);
   printOutESP32Error(getErr);
