@@ -169,8 +169,11 @@ void webSocketEvent(WStype_t type, const uint8_t *payload, size_t length) {
     case WStype_DISCONNECTED:
         Serial.println("[WS] Disconnected");
         wsConnected = false;
-        needRelogin = true;
-        if (deviceState != SLEEP) deviceState = IDLE;
+        // Don't re-auth/reconnect if we're disconnecting on purpose to sleep.
+        if (deviceState != SLEEP) {
+            needRelogin = true;
+            deviceState = IDLE;
+        }
         break;
     case WStype_CONNECTED:
         Serial.printf("[WS] Connected: %s\n", payload);
@@ -217,7 +220,8 @@ void networkTask(void *parameter) {
         // Refresh the JWT and reconnect only while actually disconnected (token may
         // have expired). Never force-reconnect while connected - the WebSocketsClient
         // auto-reconnect handles transient drops with the existing token.
-        if (needRelogin && !wsConnected && WiFi.status() == WL_CONNECTED) {
+        if (needRelogin && !wsConnected && deviceState != SLEEP &&
+            WiFi.status() == WL_CONNECTED) {
             uint32_t now = millis();
             if (now - lastRelogin > 3000) {
                 lastRelogin = now;
@@ -288,10 +292,24 @@ void audioStreamTask(void *parameter) {
     uint32_t emptySince = 0;
     uint8_t buf[1024];
 
+    // Jitter pre-roll: buffer a small cushion of decoded PCM before starting to
+    // drain, so brief gaps between inbound Opus packets don't starve the I2S DMA
+    // mid-word (which clicks/crackles). The I2S write is blocking, so once we
+    // start, playback is paced in real time and the cushion absorbs network
+    // jitter. ~150 ms @ 24 kHz / 16-bit mono = 7200 bytes.
+    const size_t PREROLL_BYTES = 7200;
+
     while (1) {
         size_t avail = spkRing.available();
         if (avail > 0) {
             if (!amp) {
+                // Wait for the cushion before the first sample. Skip the wait if
+                // the whole clip already arrived (speak-end) and it's shorter
+                // than the pre-roll, so short replies still play promptly.
+                if (avail < PREROLL_BYTES && !speakEnded) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
                 digitalWrite(I2S_SD_OUT, HIGH);  // amp on
                 amp = true;
                 if (deviceState != SLEEP) deviceState = SPEAKING;
