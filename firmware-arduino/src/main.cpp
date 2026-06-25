@@ -295,16 +295,20 @@ void setup() {
   btn->attachLongPressUpEventCb(&onButtonLongPressUpEventCb, NULL);
 #endif
 
-  // LED + mic run under every transport. (micTask gets a larger stack now because the
-  // BLE path runs the Opus encoder there.)
-  xTaskCreatePinnedToCore(ledTask, "LED Task", 4096, NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(micTask, "Microphone Task", 8192, NULL, 4, NULL, 1);
-
   // Choose transport for this boot (reboot-swap; default WiFi). See Transport.h.
-  // Double-tap-hold the touch pad (touchTask below) to swap and reboot into the other one.
+  // Double-tap-hold the touch pad (touchTask above) to swap and reboot into the other one.
+  // MUST run before micTask is created: micTask is higher priority than setup() and
+  // captures transportMode once at start, so resolving it late makes the mic boot in the
+  // wrong (default WiFi) mode and never notify over BLE.
   transportMode = loadTransportMode();
   Serial.printf("[BOOT] transport = %s\n",
                 transportMode == TRANSPORT_BLE ? "BLE" : "WiFi");
+
+  // LED + mic run under every transport. micTask needs a big stack in BLE mode because the
+  // Opus encoder runs there: opus_encode is very stack-hungry (8 KB overflowed and reset the
+  // device the instant a central connected and encoding began), so size for the worst case.
+  xTaskCreatePinnedToCore(ledTask, "LED Task", 4096, NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(micTask, "Microphone Task", 24576, NULL, 4, NULL, 1);
 
   if (transportMode == TRANSPORT_BLE) {
     // OMI-compatible BLE peripheral: mic (Opus) + buttons. No WiFi / WebSocket / speaker

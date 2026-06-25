@@ -28,6 +28,7 @@ static NimBLEServer *gServer = nullptr;
 static NimBLECharacteristic *gAudioChar = nullptr;
 static NimBLECharacteristic *gButtonChar = nullptr;
 static volatile bool gConnected = false;
+static volatile bool gAudioSubscribed = false;  // central has enabled the audio CCCD
 static uint16_t gSeq = 0;
 
 class ServerCallbacks : public NimBLEServerCallbacks {
@@ -41,9 +42,21 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     }
     void onDisconnect(NimBLEServer *s, NimBLEConnInfo &info, int reason) override {
         gConnected = false;
+        gAudioSubscribed = false;
         if (deviceState != SLEEP) deviceState = IDLE;
         Serial.printf("[BLE] central disconnected (reason %d); re-advertising\n", reason);
         NimBLEDevice::startAdvertising();
+    }
+};
+
+// Only stream audio once the central has subscribed (CCCD notify bit set). Notifying before
+// the client finishes GATT discovery + subscribes floods the link during connection setup,
+// which can stall CoreBluetooth's service discovery and time out the connect.
+class AudioCharCallbacks : public NimBLECharacteristicCallbacks {
+    void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &info, uint16_t subValue) override {
+        gAudioSubscribed = (subValue & 0x0001) != 0;  // bit0 = notifications enabled
+        Serial.printf("[BLE] audio %ssubscribed (subValue=%u)\n",
+                      gAudioSubscribed ? "" : "un", subValue);
     }
 };
 
@@ -60,6 +73,7 @@ void bleSetup(const char *deviceName) {
     // Audio service: audio NOTIFY + codec READ.
     NimBLEService *audioSvc = gServer->createService(OMI_SERVICE_UUID);
     gAudioChar = audioSvc->createCharacteristic(OMI_AUDIO_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
+    gAudioChar->setCallbacks(new AudioCharCallbacks());
     NimBLECharacteristic *codecChar =
         audioSvc->createCharacteristic(OMI_CODEC_CHAR_UUID, NIMBLE_PROPERTY::READ);
     codecChar->setValue(&CODEC_OPUS, 1);
@@ -81,7 +95,7 @@ void bleSetup(const char *deviceName) {
 bool bleIsConnected() { return gConnected; }
 
 void bleNotifyAudioFrame(const uint8_t *opus, size_t len) {
-    if (!gConnected || !gAudioChar || len == 0) return;
+    if (!gConnected || !gAudioSubscribed || !gAudioChar || len == 0) return;
     static uint8_t frame[3 + 256];
     if (len > sizeof(frame) - 3) len = sizeof(frame) - 3;  // safety clamp
     frame[0] = (uint8_t)(gSeq & 0xFF);   // 3-byte header: LE uint16 packet seq + index byte.
