@@ -185,6 +185,72 @@ static void handleOpusPacket(const uint8_t *pkt, size_t len) {
     }
 }
 
+// ── BLE speaker downlink entry points ───────────────────────────
+// opus_decode is stack-heavy and MUST NOT run on the NimBLE host task: its write callback
+// has a small stack, and decoding there overflowed and reset the device the instant the
+// first frame arrived. So the BLE write callback (BLEManager.cpp) only enqueues opcode-framed
+// messages here; speakerDecodeTask (its own large stack) owns opusDec and the spkRing
+// producer side and does the reset/decode/flag work. audioStreamTask drains spkRing -> I2S
+// exactly as in WiFi, so mic-ducking and newest-wins playback are identical in BLE mode.
+struct SpkMsg {
+    uint8_t op;          // 0=start, 1=audio, 2=end, 3=stop
+    uint16_t len;        // opus length (op==1 only)
+    uint8_t data[512];   // one Opus packet (24 kHz/60 ms VOIP packets are well under this)
+};
+static QueueHandle_t spkQueue = nullptr;
+
+// Called from the NimBLE host-task write callback — keep it cheap (copy + non-blocking send).
+static void spkEnqueue(uint8_t op, const uint8_t *pkt, size_t len) {
+    if (!spkQueue) return;  // decode task not up yet (very early boot) -> drop
+    SpkMsg m;
+    m.op = op;
+    m.len = 0;
+    if (op == 1) {
+        if (len > sizeof(m.data)) len = sizeof(m.data);
+        m.len = (uint16_t)len;
+        memcpy(m.data, pkt, len);
+    }
+    xQueueSend(spkQueue, &m, 0);  // drop on overflow rather than stall the BLE host task
+}
+
+void speakerBegin()                                  { spkEnqueue(0, nullptr, 0); }
+void speakerFeedOpus(const uint8_t *pkt, size_t len) { spkEnqueue(1, pkt, len); }
+void speakerEnd()                                    { spkEnqueue(2, nullptr, 0); }
+void speakerStop()                                   { spkEnqueue(3, nullptr, 0); }
+
+// Decodes queued Opus -> spkRing on its own stack. Single producer of spkRing (audioStreamTask
+// is the single consumer), so the SPSC invariant holds. opusDec is created by audioStreamTask;
+// handleOpusPacket / the resets below all null-check it, so a brief startup race is safe.
+void speakerDecodeTask(void *parameter) {
+    spkQueue = xQueueCreate(16, sizeof(SpkMsg));
+    SpkMsg m;
+    for (;;) {
+        if (xQueueReceive(spkQueue, &m, portMAX_DELAY) != pdTRUE) continue;
+        switch (m.op) {
+            case 0:  // speak-start: newest-wins reset, then arm playback
+                spkRing.reset();
+                if (opusDec) opus_decoder_ctl(opusDec, OPUS_RESET_STATE);
+                speakEnded = false;
+                speakActive = true;
+                Serial.println("[spk/ble] speak-start");
+                break;
+            case 1:  // audio packet
+                handleOpusPacket(m.data, m.len);
+                break;
+            case 2:  // speak-end: drain then stop
+                speakEnded = true;
+                Serial.println("[spk/ble] speak-end");
+                break;
+            case 3:  // speak-stop / barge-in: flush now
+                spkRing.reset();
+                if (opusDec) opus_decoder_ctl(opusDec, OPUS_RESET_STATE);
+                speakEnded = true;
+                Serial.println("[spk/ble] speak-stop");
+                break;
+        }
+    }
+}
+
 // ── websocket event handler (runs inside networkTask, wsMutex held) ──
 void webSocketEvent(WStype_t type, const uint8_t *payload, size_t length) {
     switch (type) {

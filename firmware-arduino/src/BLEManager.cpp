@@ -13,23 +13,39 @@
  */
 #include "BLEManager.h"
 #include "Config.h"
+#include "Audio.h"
 #include <NimBLEDevice.h>
 
 // ── OMI GATT UUIDs (must match friend-lite-sdk/friend_lite/uuids.py exactly) ──
 static const char *OMI_SERVICE_UUID        = "19B10000-E8F2-537E-4F6C-D104768A1214";
 static const char *OMI_AUDIO_CHAR_UUID     = "19B10001-E8F2-537E-4F6C-D104768A1214";
 static const char *OMI_CODEC_CHAR_UUID     = "19B10002-E8F2-537E-4F6C-D104768A1214";
+// Elato-specific speaker downlink (no OMI equivalent — OMI devices have no speaker). The
+// relay writes Opus 24 kHz frames here; framing is a 1-byte opcode (see SpeakerCharCallbacks).
+static const char *ELATO_SPEAKER_CHAR_UUID = "19B10004-E8F2-537E-4F6C-D104768A1214";
 static const char *OMI_BUTTON_SERVICE_UUID = "23BA7924-0000-1000-7450-346EAC492E92";
 static const char *OMI_BUTTON_CHAR_UUID    = "23BA7925-0000-1000-7450-346EAC492E92";
 
 static const uint8_t CODEC_OPUS = 20;  // friend-lite mapping: 0=PCM16, 1=PCM8, 20=Opus
 
+// Speaker-write opcodes (byte 0 of every write to the speaker characteristic).
+static const uint8_t SPK_OP_START = 0x01;  // speak-start: reset + arm playback (no payload)
+static const uint8_t SPK_OP_END   = 0x02;  // speak-end: drain then stop (no payload)
+static const uint8_t SPK_OP_STOP  = 0x03;  // speak-stop / barge-in: flush now (no payload)
+static const uint8_t SPK_OP_AUDIO = 0x10;  // [0x10][flags][opus...]; flags bit0 = final fragment
+
 static NimBLEServer *gServer = nullptr;
 static NimBLECharacteristic *gAudioChar = nullptr;
 static NimBLECharacteristic *gButtonChar = nullptr;
+static NimBLECharacteristic *gSpeakerChar = nullptr;
 static volatile bool gConnected = false;
 static volatile bool gAudioSubscribed = false;  // central has enabled the audio CCCD
 static uint16_t gSeq = 0;
+
+// Reassembly buffer for fragmented Opus frames (writes can be smaller than a full packet at
+// the negotiated MTU). Written only from the NimBLE host task (single writer), so no lock.
+static uint8_t gSpkAsm[1024];
+static size_t gSpkAsmLen = 0;
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer *s, NimBLEConnInfo &info) override {
@@ -60,6 +76,42 @@ class AudioCharCallbacks : public NimBLECharacteristicCallbacks {
     }
 };
 
+// Speaker downlink: the relay writes opcode-framed Opus here; we reassemble fragments and feed
+// the existing speaker path (Audio.cpp speaker* fns -> spkRing -> audioStreamTask -> I2S).
+class SpeakerCharCallbacks : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &info) override {
+        const std::string v = c->getValue();
+        if (v.empty()) return;
+        const uint8_t *p = (const uint8_t *)v.data();
+        const size_t n = v.size();
+        switch (p[0]) {
+            case SPK_OP_START: gSpkAsmLen = 0; speakerBegin(); break;
+            case SPK_OP_END:   speakerEnd();   break;
+            case SPK_OP_STOP:  gSpkAsmLen = 0; speakerStop(); break;
+            case SPK_OP_AUDIO: {
+                if (n < 2) break;                      // need opcode + flags
+                const bool final = (p[1] & 0x01) != 0;
+                const size_t dlen = n - 2;
+                if (gSpkAsmLen + dlen > sizeof(gSpkAsm)) {  // overrun: drop this frame
+                    gSpkAsmLen = 0;
+                    Serial.println("[spk/ble] frame too large, dropped");
+                    break;
+                }
+                memcpy(gSpkAsm + gSpkAsmLen, p + 2, dlen);
+                gSpkAsmLen += dlen;
+                if (final) {
+                    speakerFeedOpus(gSpkAsm, gSpkAsmLen);
+                    gSpkAsmLen = 0;
+                }
+                break;
+            }
+            default:
+                Serial.printf("[spk/ble] unknown opcode 0x%02X\n", p[0]);
+                break;
+        }
+    }
+};
+
 void bleSetup(const char *deviceName) {
     NimBLEDevice::init(deviceName);
     // Ask for a larger ATT MTU so a whole Opus packet rides in one notification. iOS still
@@ -70,13 +122,18 @@ void bleSetup(const char *deviceName) {
     gServer = NimBLEDevice::createServer();
     gServer->setCallbacks(new ServerCallbacks());
 
-    // Audio service: audio NOTIFY + codec READ.
+    // Audio service: mic audio NOTIFY + codec READ + speaker WRITE (downlink).
     NimBLEService *audioSvc = gServer->createService(OMI_SERVICE_UUID);
     gAudioChar = audioSvc->createCharacteristic(OMI_AUDIO_CHAR_UUID, NIMBLE_PROPERTY::NOTIFY);
     gAudioChar->setCallbacks(new AudioCharCallbacks());
     NimBLECharacteristic *codecChar =
         audioSvc->createCharacteristic(OMI_CODEC_CHAR_UUID, NIMBLE_PROPERTY::READ);
     codecChar->setValue(&CODEC_OPUS, 1);
+    // Speaker downlink: WRITE_NR for streaming throughput (relay paces frames), WRITE so a
+    // client can also use acked writes. Opcode-framed Opus reassembled in SpeakerCharCallbacks.
+    gSpeakerChar = audioSvc->createCharacteristic(
+        ELATO_SPEAKER_CHAR_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+    gSpeakerChar->setCallbacks(new SpeakerCharCallbacks());
     audioSvc->start();
 
     // Button service.
@@ -89,7 +146,8 @@ void bleSetup(const char *deviceName) {
     adv->setName(deviceName);
     adv->enableScanResponse(true);
     NimBLEDevice::startAdvertising();
-    Serial.printf("[BLE] advertising as \"%s\" (OMI-compatible, Opus 16 kHz)\n", deviceName);
+    Serial.printf("[BLE] advertising as \"%s\" (OMI mic 16 kHz + speaker 24 kHz, Opus)\n",
+                  deviceName);
 }
 
 bool bleIsConnected() { return gConnected; }

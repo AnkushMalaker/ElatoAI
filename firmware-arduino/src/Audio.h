@@ -35,4 +35,13 @@ void micTask(void *parameter);          // mic (streams PCM via Wyoming audio-ch
 // Send a Wyoming button-event ("SINGLE_PRESS" / "DOUBLE_PRESS" / "LONG_PRESS").
 void sendButtonEvent(const char *state);
 
+// BLE speaker downlink: feed the speaker path from the NimBLE write callback. These mirror
+// the WiFi speak-start / opus-packet / speak-end / speak-stop handling and reuse the same
+// spkRing/opusDec/audioStreamTask. audioStreamTask must be running (creates opusDec @24kHz).
+void speakerBegin();                                   // speak-start: reset ring, arm playback
+void speakerFeedOpus(const uint8_t *pkt, size_t len);  // one complete Opus packet (24 kHz mono)
+void speakerEnd();                                     // speak-end: drain then stop
+void speakerStop();                                    // barge-in: flush and stop now
+void speakerDecodeTask(void *parameter);               // decodes queued Opus -> spkRing (own stack)
+
 #endif

@@ -311,9 +311,14 @@ void setup() {
   xTaskCreatePinnedToCore(micTask, "Microphone Task", 24576, NULL, 4, NULL, 1);
 
   if (transportMode == TRANSPORT_BLE) {
-    // OMI-compatible BLE peripheral: mic (Opus) + buttons. No WiFi / WebSocket / speaker
-    // downlink in this mode (OMI BLE clients don't push audio back to the device).
+    // OMI-compatible BLE peripheral: mic (Opus) up + buttons, and speaker (Opus) down via a
+    // writable GATT char that the relay client feeds. audioStreamTask creates opusDec @24kHz
+    // and inits I2S-out — it must run here too so BLE speaker downlink has a decoder + sink.
     setLedOverride(0, 0, 255, 1500);  // blue = BLE
+    xTaskCreatePinnedToCore(audioStreamTask, "Speaker Task", 4096, NULL, 3, NULL, 1);
+    // Opus decode for the speaker downlink runs here (NOT in the BLE write callback —
+    // opus_decode overflows the small NimBLE host-task stack). 8 KB for opus_decode.
+    xTaskCreatePinnedToCore(speakerDecodeTask, "Spk Decode", 8192, NULL, 3, NULL, 1);
     bleSetup("Elato");
   } else {
     // WiFi + Wyoming WebSocket, full duplex (includes speaker downlink).
