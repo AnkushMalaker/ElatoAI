@@ -17,6 +17,8 @@
  */
 #include "Audio.h"
 #include "LEDHandler.h"
+#include "Transport.h"
+#include "BLEManager.h"
 #include <WiFi.h>
 #include <math.h>
 #include <opus.h>
@@ -95,8 +97,19 @@ static void sendAudioStartRaw() {
     Serial.println("[WS] audio-start sent");
 }
 
-// Wyoming button-event - called from the touch/button task (takes wsMutex).
+// Button event - BLE notify (OMI button char) or Wyoming button-event over WS, per transport.
+// Called from the touch/button task.
 void sendButtonEvent(const char *state) {
+    if (transportMode == TRANSPORT_BLE) {
+        if (!bleIsConnected()) return;
+        uint32_t s = 0;
+        if (!strcmp(state, "SINGLE_PRESS")) s = 1;
+        else if (!strcmp(state, "DOUBLE_PRESS")) s = 2;
+        else if (!strcmp(state, "LONG_PRESS")) s = 3;
+        bleNotifyButton(s);
+        Serial.printf("[BLE] button-event %s\n", state);
+        return;
+    }
     if (!wsConnected) return;
     char msg[128];
     int n = snprintf(msg, sizeof(msg),
@@ -139,6 +152,15 @@ static void handleTextMessage(const uint8_t *payload, size_t length) {
     } else if (strcmp(mtype, "speak-end") == 0) {
         speakEnded = true;  // audioStreamTask drains the ring then stops
         Serial.println("[spk] speak-end");
+    } else if (strcmp(mtype, "speak-stop") == 0) {
+        // Barge-in / hard stop (e.g. a button press): drop any buffered audio and
+        // end playback now instead of draining. Same producer-side reset as
+        // speak-start; emptying the ring + marking ended makes audioStreamTask
+        // flush I2S and power the amp down on its next pass (~40 ms).
+        spkRing.reset();
+        if (opusDec) opus_decoder_ctl(opusDec, OPUS_RESET_STATE);
+        speakEnded = true;
+        Serial.println("[spk] speak-stop");
     } else if (strcmp(mtype, "led-control") == 0) {
         handleLedControl(doc["data"]);
     } else if (strcmp(mtype, "pong") == 0) {
@@ -365,21 +387,46 @@ void micTask(void *parameter) {
     cfg.port_no = I2S_PORT_IN;
     i2sInput.begin(cfg);
 
-    const int FRAMES = 512;  // 32 ms @ 16 kHz
-    static int32_t in32[FRAMES];
-    static int16_t out16[FRAMES];
+    // Transport is fixed for this boot (reboot-swap), so branch once here:
+    //   BLE : encode 60 ms (960-sample) Opus frames, one packet per BLE notification.
+    //   WiFi: stream raw 16-bit PCM as Wyoming audio-chunk (original behaviour).
+    const bool ble = (transportMode == TRANSPORT_BLE);
+    const int FRAMES = ble ? 960 : 512;  // 60 ms Opus frame vs 32 ms PCM chunk @ 16 kHz
+    static int32_t in32[960];
+    static int16_t out16[960];
+    static uint8_t opusBuf[256];
     char header[160];
 
+    OpusEncoder *micEnc = nullptr;
+    if (ble) {
+        int err = 0;
+        micEnc = opus_encoder_create(16000, 1, OPUS_APPLICATION_VOIP, &err);
+        if (!micEnc || err != OPUS_OK) {
+            Serial.printf("[BLE] opus encoder init failed: %d\n", err);
+            vTaskDelete(NULL);
+            return;
+        }
+        // ~16 kbps keeps a 60 ms packet near ~120 bytes, so it fits one BLE notification
+        // even at the small ATT MTU iOS negotiates (payload ~182, plus our 3-byte header).
+        opus_encoder_ctl(micEnc, OPUS_SET_BITRATE(16000));
+        opus_encoder_ctl(micEnc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+    }
+
     while (1) {
-        if (!wsConnected) {
+        bool connected = ble ? bleIsConnected() : wsConnected;
+        if (!connected) {
             vTaskDelay(10);
             continue;
         }
-        size_t nbytes = i2sInput.readBytes((uint8_t *)in32, FRAMES * sizeof(int32_t));
-        int nsamp = nbytes / sizeof(int32_t);
-        if (nsamp == 0) {
-            vTaskDelay(1);
-            continue;
+
+        // I2S reads can be short; accumulate exactly FRAMES samples (Opus needs a full frame).
+        int got = 0;
+        while (got < FRAMES) {
+            size_t nbytes = i2sInput.readBytes((uint8_t *)(in32 + got),
+                                               (FRAMES - got) * sizeof(int32_t));
+            int ns = nbytes / sizeof(int32_t);
+            if (ns <= 0) { vTaskDelay(1); continue; }
+            got += ns;
         }
 
         // Duck our own playback: keep draining the I2S DMA (above) but don't send the
@@ -389,22 +436,27 @@ void micTask(void *parameter) {
             continue;
         }
 
-        for (int i = 0; i < nsamp; i++) {
+        for (int i = 0; i < FRAMES; i++) {
             int32_t v = in32[i] >> MIC_GAIN_SHIFT;
             if (v > 32767) v = 32767;
             else if (v < -32768) v = -32768;
             out16[i] = (int16_t)v;
         }
-        size_t outBytes = (size_t)nsamp * sizeof(int16_t);
 
-        int hlen = snprintf(header, sizeof(header),
-            "{\"type\":\"audio-chunk\",\"data\":{\"rate\":16000,\"width\":2,\"channels\":1},"
-            "\"payload_length\":%u}", (unsigned)outBytes);
-
-        xSemaphoreTake(wsMutex, portMAX_DELAY);
-        bool ok = webSocket.sendTXT((uint8_t *)header, hlen);
-        if (ok) webSocket.sendBIN((uint8_t *)out16, outBytes);
-        xSemaphoreGive(wsMutex);
+        if (ble) {
+            int n = opus_encode(micEnc, out16, FRAMES, opusBuf, sizeof(opusBuf));
+            if (n > 0) bleNotifyAudioFrame(opusBuf, (size_t)n);
+            else if (n < 0) Serial.printf("[BLE] opus_encode err %d\n", n);
+        } else {
+            size_t outBytes = (size_t)FRAMES * sizeof(int16_t);
+            int hlen = snprintf(header, sizeof(header),
+                "{\"type\":\"audio-chunk\",\"data\":{\"rate\":16000,\"width\":2,\"channels\":1},"
+                "\"payload_length\":%u}", (unsigned)outBytes);
+            xSemaphoreTake(wsMutex, portMAX_DELAY);
+            bool ok = webSocket.sendTXT((uint8_t *)header, hlen);
+            if (ok) webSocket.sendBIN((uint8_t *)out16, outBytes);
+            xSemaphoreGive(wsMutex);
+        }
 
         vTaskDelay(1);
     }

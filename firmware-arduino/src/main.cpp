@@ -2,6 +2,8 @@
 #include "LEDHandler.h"
 #include "OTA.h"
 #include "WifiManager.h"
+#include "Transport.h"
+#include "BLEManager.h"
 #include <driver/touch_sensor.h>
 #include <esp_sleep.h>
 
@@ -165,21 +167,28 @@ void setupWiFi() {
   webServer.begin();
 }
 
-// Touch -> Chronicle button-events:
-//   short tap          -> SINGLE_PRESS
-//   two taps (<400ms)  -> DOUBLE_PRESS
-//   long hold (>1.5s)  -> sleep
+// Touch -> Chronicle gestures:
+//   short tap                 -> SINGLE_PRESS
+//   two quick taps (<400ms)   -> DOUBLE_PRESS
+//   long hold (>1.5s)         -> sleep
+//   tap, then press-and-hold  -> swap transport (WiFi<->BLE) + reboot   [double-tap-hold]
+//
+// The swap gesture is the SECOND press of a double being held; the sleep gesture is a
+// lone press being held. We distinguish them by whether a first tap is still pending, so
+// holding the second press triggers a swap instead of sleep.
 void touchTask(void *parameter) {
   touch_pad_init();
   touch_pad_config(TOUCH_PAD_NUM2);
 
   bool touched = false;
-  bool longHandled = false;
-  bool tapPending = false;
+  bool gestureHandled = false;  // this press already fired sleep/swap; ignore further holds
+  bool isSecondPress = false;   // current press is the 2nd of a potential double
+  bool tapPending = false;      // a first short tap is awaiting its partner
   unsigned long pressStart = 0;
   unsigned long lastRelease = 0;
   unsigned long tapFirstTime = 0;
-  const unsigned long LONG_PRESS_MS = 1500;
+  const unsigned long LONG_PRESS_MS = 1500;  // lone hold -> sleep
+  const unsigned long SWAP_HOLD_MS = 700;    // 2nd-press hold -> transport swap
   const unsigned long DOUBLE_GAP_MS = 400;
   const unsigned long TAP_MAX_MS = 800;
   const unsigned long DEBOUNCE_MS = 50;
@@ -193,14 +202,21 @@ void touchTask(void *parameter) {
     if (isTouched && !touched && (now - lastRelease > DEBOUNCE_MS)) {
       touched = true;
       pressStart = now;
-      longHandled = false;
+      gestureHandled = false;
+      isSecondPress = (tapPending && (now - tapFirstTime <= DOUBLE_GAP_MS));
     }
 
-    // Long hold -> sleep
-    if (touched && isTouched && !longHandled &&
-        (now - pressStart >= LONG_PRESS_MS)) {
-      longHandled = true;
-      sleepRequested = true;
+    // Hold handling: 2nd-press hold -> swap; lone-press hold -> sleep
+    if (touched && isTouched && !gestureHandled) {
+      unsigned long held = now - pressStart;
+      if (isSecondPress && held >= SWAP_HOLD_MS) {
+        gestureHandled = true;
+        tapPending = false;
+        requestTransportSwap();  // persists new mode + reboots (does not return)
+      } else if (!isSecondPress && held >= LONG_PRESS_MS) {
+        gestureHandled = true;
+        sleepRequested = true;
+      }
     }
 
     // Release edge
@@ -208,19 +224,22 @@ void touchTask(void *parameter) {
       touched = false;
       lastRelease = now;
       unsigned long dur = now - pressStart;
-      if (!longHandled && dur < TAP_MAX_MS) {
-        if (tapPending && (now - tapFirstTime <= DOUBLE_GAP_MS)) {
-          tapPending = false;
-          sendButtonEvent("DOUBLE_PRESS");
-        } else {
-          tapPending = true;
-          tapFirstTime = now;
-        }
+      if (gestureHandled) {
+        isSecondPress = false;  // already acted
+      } else if (isSecondPress) {
+        // 2nd press released before the swap-hold threshold -> a normal double tap
+        tapPending = false;
+        isSecondPress = false;
+        sendButtonEvent("DOUBLE_PRESS");
+      } else if (dur < TAP_MAX_MS) {
+        // first short tap -> wait for a partner press
+        tapPending = true;
+        tapFirstTime = now;
       }
     }
 
-    // Resolve a single tap once the double-tap window passes
-    if (tapPending && (now - tapFirstTime > DOUBLE_GAP_MS)) {
+    // Resolve a lone single tap once the double-tap window passes
+    if (tapPending && !touched && (now - tapFirstTime > DOUBLE_GAP_MS)) {
       tapPending = false;
       sendButtonEvent("SINGLE_PRESS");
     }
@@ -276,46 +295,30 @@ void setup() {
   btn->attachLongPressUpEventCb(&onButtonLongPressUpEventCb, NULL);
 #endif
 
-  // Pin audio tasks to Core 1 (application core)
-  xTaskCreatePinnedToCore(ledTask,    // Function
-                          "LED Task", // Name
-                          4096,       // Stack size
-                          NULL,       // Parameters
-                          5,          // Priority
-                          NULL,       // Handle
-                          1           // Core 1 (application core)
-  );
+  // LED + mic run under every transport. (micTask gets a larger stack now because the
+  // BLE path runs the Opus encoder there.)
+  xTaskCreatePinnedToCore(ledTask, "LED Task", 4096, NULL, 5, NULL, 1);
+  xTaskCreatePinnedToCore(micTask, "Microphone Task", 8192, NULL, 4, NULL, 1);
 
-  xTaskCreatePinnedToCore(audioStreamTask, // Function
-                          "Speaker Task",  // Name
-                          4096,            // Stack size
-                          NULL,            // Parameters
-                          3,               // Priority
-                          NULL,            // Handle
-                          1                // Core 1 (application core)
-  );
+  // Choose transport for this boot (reboot-swap; default WiFi). See Transport.h.
+  // Double-tap-hold the touch pad (touchTask below) to swap and reboot into the other one.
+  transportMode = loadTransportMode();
+  Serial.printf("[BOOT] transport = %s\n",
+                transportMode == TRANSPORT_BLE ? "BLE" : "WiFi");
 
-  xTaskCreatePinnedToCore(micTask,           // Function
-                          "Microphone Task", // Name
-                          4096,              // Stack size
-                          NULL,              // Parameters
-                          4,                 // Priority
-                          NULL,              // Handle
-                          1                  // Core 1 (application core)
-  );
-
-  // Pin network task to Core 0 (protocol core)
-  xTaskCreatePinnedToCore(networkTask,              // Function
-                          "Websocket Task",         // Name
-                          8192,                     // Stack size
-                          NULL,                     // Parameters
-                          configMAX_PRIORITIES - 1, // Highest priority
-                          &networkTaskHandle,       // Handle
-                          0                         // Core 0 (protocol core)
-  );
-
-  // WIFI
-  setupWiFi();
+  if (transportMode == TRANSPORT_BLE) {
+    // OMI-compatible BLE peripheral: mic (Opus) + buttons. No WiFi / WebSocket / speaker
+    // downlink in this mode (OMI BLE clients don't push audio back to the device).
+    setLedOverride(0, 0, 255, 1500);  // blue = BLE
+    bleSetup("Elato");
+  } else {
+    // WiFi + Wyoming WebSocket, full duplex (includes speaker downlink).
+    setLedOverride(0, 255, 0, 1500);  // green = WiFi
+    xTaskCreatePinnedToCore(audioStreamTask, "Speaker Task", 4096, NULL, 3, NULL, 1);
+    xTaskCreatePinnedToCore(networkTask, "Websocket Task", 8192, NULL,
+                            configMAX_PRIORITIES - 1, &networkTaskHandle, 0);
+    setupWiFi();
+  }
 }
 
 void loop() {
