@@ -90,11 +90,14 @@ unsigned long getSpeakingDuration() {
 // ── outbound helpers ────────────────────────────────────────────
 // Raw (no mutex) - only call from inside webSocketEvent, where wsMutex is held.
 static void sendAudioStartRaw() {
+    // playback:"opus" tells the backend to stream TTS downlink as 24 kHz Opus frames
+    // (speak-start/Opus/speak-end) rather than a single base64 WAV blob — this RAM-
+    // limited device can't take a big WAV frame and decodes Opus on the speaker path.
     static const char *m =
         "{\"type\":\"audio-start\",\"data\":{\"rate\":16000,\"width\":2,\"channels\":1,"
-        "\"mode\":\"streaming\"},\"payload_length\":0}";
+        "\"mode\":\"streaming\"},\"playback\":\"opus\",\"payload_length\":0}";
     webSocket.sendTXT((uint8_t *)m, strlen(m));
-    Serial.println("[WS] audio-start sent");
+    Serial.println("[WS] audio-start sent (playback=opus)");
 }
 
 // Button event - BLE notify (OMI button char) or Wyoming button-event over WS, per transport.

@@ -69,9 +69,14 @@ void setStaticColor(StaticColor color)
         break;
     }
 
-    digitalWrite(RED_LED_PIN, colorMap.red);
-    digitalWrite(GREEN_LED_PIN, colorMap.green);
-    digitalWrite(BLUE_LED_PIN, colorMap.blue);
+    // Drive via setLEDColor (analogWrite/LEDC), NOT digitalWrite: the boot override
+    // (setLedOverride) binds these pins to LEDC PWM channels, after which digitalWrite
+    // is a no-op and the LED stays frozen at the last override color. Going through the
+    // same analogWrite path keeps static colors consistent and actually updating.
+    // Active-low LED: LOW level = full-on (0), HIGH = off (255).
+    setLEDColor(colorMap.red ? 255 : 0,
+                colorMap.green ? 255 : 0,
+                colorMap.blue ? 255 : 0);
 }
 
 void loopCyanPinkYellow()
